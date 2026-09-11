@@ -15,8 +15,8 @@ This answers *is that number real*.
 ## Status
 
 - [x] Deflated Sharpe Ratio (`src/auditor/sharpe.py`)
-- [ ] PBO via combinatorially symmetric cross-validation (CSCV)
-- [ ] White's Reality Check
+- [x] PBO via combinatorially symmetric cross-validation (CSCV)
+- [x] White's Reality Check (+ stationary bootstrap, `src/auditor/bootstrap.py`)
 - [ ] C++20 CSCV kernel + pybind11
 - [ ] Calibration study: ROC curves against known ground-truth alpha
 - [ ] Autocorrelation-robust PBO (block bootstrap)
@@ -27,7 +27,8 @@ This answers *is that number real*.
 py -m venv .venv
 .venv\Scripts\activate
 pip install -e ".[dev]"
-pytest
+pytest              # fast suite
+pytest -m slow      # Monte Carlo calibration + large-S differential tests
 ```
 
 ## Conventions

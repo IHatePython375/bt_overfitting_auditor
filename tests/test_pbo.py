@@ -80,7 +80,9 @@ def test_partition_count_is_the_binomial_coefficient():
 # The two scoring paths agree
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("n_blocks", [12, 14])
+@pytest.mark.parametrize(
+    "n_blocks", [12, pytest.param(14, marks=pytest.mark.slow)]
+)
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_naive_and_sufstats_agree(n_blocks, seed):
     """
@@ -304,6 +306,7 @@ def test_duplicate_columns_do_not_move_pbo():
 # Analytic limits
 # --------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_null_winner_rank_is_uniform():
     """
     The exchangeability argument, checked by Monte Carlo.
@@ -330,6 +333,7 @@ def test_null_winner_rank_is_uniform():
     assert chisquare(counts, expected).pvalue > 0.01
 
 
+@pytest.mark.slow
 def test_null_pbo_is_one_half():
     """
     Follows from the uniform rank: PBO = P(rank <= N/2) = 1/2 exactly, for
