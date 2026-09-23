@@ -20,20 +20,29 @@ only through ranks, so any strictly monotone transform applied uniformly
 across strategies -- annualization included -- cancels out. The units
 footgun that is lethal in DSR is inert here. Do not "fix" it.
 
-TWO IMPLEMENTATIONS
--------------------
+THREE IMPLEMENTATIONS
+---------------------
 _pbo_naive      slices the actual return rows and computes Sharpe from
                 scratch. Obviously correct by inspection; unusable past
                 S = 16.
 _pbo_sufstats   precomputes per-block (n, sum, sumsq) per strategy, so each
                 partition is a reduction over the chosen blocks. This is the
-                shape the week-2 C++ kernel mirrors.
+                shape the C++ kernel mirrors.
+_pbo_cpp        the same reduction in C++20 (src/kernel/cscv.hpp), threaded
+                over partitions. Optional: absent unless
+                scripts/build_kernel.py has been run, and every path here
+                falls back rather than failing.
 
 They exist side by side on purpose. Differential-testing Python against C++
 catches implementation divergence, but it cannot catch a shared design
 error: if both are structured around the same block decomposition and that
 reasoning is wrong, both return the same wrong answer and every test passes.
 The naive path is the oracle that does not share the assumption.
+
+The kernel receives (counts, sums, sumsq) and nothing else -- make_blocks and
+block_stats stay here. So the C++ cannot disagree with the Python about where
+the block boundaries are, and a differential failure localises to the
+combinatorial reduction, which is the only thing that was ported.
 """
 
 from __future__ import annotations
@@ -44,10 +53,40 @@ from math import comb
 import numpy as np
 from scipy.stats import rankdata
 
+try:
+    from . import _cscv  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - depends on whether the build was run
+    _cscv = None
+
 # Score for strategies with no variance over the selected rows. -inf rather
 # than nan so that argmax skips them instead of propagating, and so they
 # rank last out-of-sample instead of poisoning the whole rank vector.
 DEGENERATE_SCORE = -np.inf
+
+
+def kernel_available() -> bool:
+    """Whether the compiled C++ kernel is importable."""
+    return _cscv is not None
+
+
+def kernel_info() -> dict | None:
+    """
+    Build facts for the compiled kernel, or None if it is not built.
+
+    ``fp_contract_off`` is not trivia. The kernel agrees with the Python path
+    bit for bit only while FMA contraction is disabled; with it on, the
+    differential test has to fall back to a tolerance, and a tolerance loose
+    enough to pass is loose enough to hide a real bug. Reporting it makes a
+    mis-built kernel visible instead of quietly weakening the guarantee.
+    """
+    if _cscv is None:
+        return None
+    return {
+        "version": _cscv.__version__,
+        "compiler": _cscv.compiler,
+        "fp_contract_off": _cscv.fp_contract_off,
+        "fast_math": _cscv.fast_math,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -217,32 +256,44 @@ def partition_lambda(
 
 
 def _assemble(
-    lambdas: np.ndarray,
-    ranks: np.ndarray,
-    rel_ranks: np.ndarray,
-    winners: np.ndarray,
+    pbo_value: float,
+    n_part: int,
+    lambdas: np.ndarray | None,
+    ranks: np.ndarray | None,
+    rel_ranks: np.ndarray | None,
+    winners: np.ndarray | None,
     blocks: list[tuple[int, int]],
     shape: tuple[int, int],
     n_degenerate: int,
     method: str,
-    is_scores: np.ndarray | None,
-    oos_scores: np.ndarray | None,
+    is_scores: np.ndarray | None = None,
+    oos_scores: np.ndarray | None = None,
 ) -> dict:
-    """Common result dict. Detectors return dicts, not floats."""
+    """
+    Common result dict. Detectors return dicts, not floats.
+
+    `pbo_value` and `n_part` are passed rather than derived from `lambdas`
+    because the C++ path can run in summary-only mode, where the per-partition
+    arrays are never materialised -- at C(32,16) they would be about 17 GB.
+    The summary keys are therefore always present and the detail keys are not,
+    which is the honest shape: a caller can test for "lambdas" rather than
+    finding an empty array.
+    """
     result = {
-        "pbo": float(np.mean(lambdas < 0.0)),
-        "lambdas": lambdas,
-        "oos_ranks": ranks,
-        "relative_ranks": rel_ranks,
-        "n_star": winners,
+        "pbo": pbo_value,
         "blocks": blocks,
-        "n_partitions": int(lambdas.size),
+        "n_partitions": n_part,
         "n_blocks": len(blocks),
         "n_obs": shape[0],
         "n_strategies": shape[1],
         "n_degenerate": n_degenerate,
         "method": method,
     }
+    if lambdas is not None:
+        result["lambdas"] = lambdas
+        result["oos_ranks"] = ranks
+        result["relative_ranks"] = rel_ranks
+        result["n_star"] = winners
     if is_scores is not None:
         result["is_scores"] = is_scores
         result["oos_scores"] = oos_scores
@@ -290,8 +341,11 @@ def _pbo_naive(returns: np.ndarray, n_blocks: int, store_scores: bool) -> dict:
             is_all.append(is_scores)
             oos_all.append(oos_scores)
 
+    lambdas = np.asarray(lam)
     return _assemble(
-        np.asarray(lam),
+        float(np.mean(lambdas < 0.0)),
+        int(lambdas.size),
+        lambdas,
         np.asarray(rks),
         np.asarray(wvs),
         np.asarray(wins, dtype=int),
@@ -347,8 +401,11 @@ def _pbo_sufstats(returns: np.ndarray, n_blocks: int, store_scores: bool) -> dic
             is_all.append(is_scores)
             oos_all.append(oos_scores)
 
+    lambdas = np.asarray(lam)
     return _assemble(
-        np.asarray(lam),
+        float(np.mean(lambdas < 0.0)),
+        int(lambdas.size),
+        lambdas,
         np.asarray(rks),
         np.asarray(wvs),
         np.asarray(wins, dtype=int),
@@ -362,6 +419,58 @@ def _pbo_sufstats(returns: np.ndarray, n_blocks: int, store_scores: bool) -> dic
 
 
 # --------------------------------------------------------------------------
+# Path 3: the C++ kernel
+# --------------------------------------------------------------------------
+
+def _pbo_cpp(
+    returns: np.ndarray,
+    n_blocks: int,
+    store_lambdas: bool,
+    n_threads: int,
+) -> dict:
+    """
+    CSCV with the partition loop in C++20, threaded over partitions.
+
+    Everything before the loop stays in numpy: the blocks and the sufficient
+    statistics are built here and handed over. What crosses the boundary is
+    three small arrays -- (S,) and two (S, N) -- regardless of T, so the
+    marshalling cost does not scale with the data.
+
+    The kernel splits partitions into contiguous index ranges, one per thread,
+    and each thread writes only into its own slice. The result is therefore
+    identical for any thread count, which is what makes `n_threads` a
+    performance knob and not a source of answers that drift with the machine.
+    """
+    if _cscv is None:  # pragma: no cover - guarded by the caller
+        raise RuntimeError(
+            "the C++ kernel is not built; run scripts/build_kernel.py "
+            "or use method='sufstats'"
+        )
+
+    blocks = make_blocks(returns.shape[0], n_blocks)
+    counts, sums, sumsq = block_stats(returns, blocks)
+
+    raw = _cscv.run(counts, sums, sumsq, store_lambdas, n_threads)
+
+    # PBO comes from the kernel's own streaming count, not from re-reducing
+    # the lambda array here. In summary-only mode there is no array to reduce,
+    # and having the headline number arrive by one route in both modes means
+    # the two modes cannot disagree.
+    return _assemble(
+        float(raw["n_negative"]) / float(raw["n_partitions"]),
+        int(raw["n_partitions"]),
+        raw["lambdas"] if store_lambdas else None,
+        raw["oos_ranks"] if store_lambdas else None,
+        raw["relative_ranks"] if store_lambdas else None,
+        raw["n_star"].astype(int) if store_lambdas else None,
+        blocks,
+        returns.shape,
+        int(raw["n_degenerate"]),
+        "cpp",
+    )
+
+
+# --------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------
 
@@ -370,6 +479,8 @@ def pbo(
     n_blocks: int = 16,
     method: str = "auto",
     store_scores: bool = False,
+    store_lambdas: bool = True,
+    n_threads: int = 0,
 ) -> dict:
     """
     Probability of Backtest Overfitting for a (T, N) matrix of per-period
@@ -381,12 +492,28 @@ def pbo(
     n_blocks : S, must be even. C(S, S/2) partitions get enumerated, so
         C(16,8) = 12,870, C(24,12) = 2,704,156, C(32,16) = 601,080,390.
         The third row is why the C++ kernel exists.
-    method : "auto" (= "sufstats"), "sufstats", or "naive".
+    method : "auto", "cpp", "sufstats", or "naive".
+
+        "auto" picks "cpp" when the kernel is built and "sufstats"
+        otherwise, except that `store_scores=True` always selects
+        "sufstats" -- the kernel structurally cannot produce per-partition
+        score matrices, since refusing to materialise them is the point.
+        That is dispatch rather than a silent downgrade: the result's
+        "method" key always says which path actually ran.
     store_scores : keep the full per-partition score matrices. Off by default
         because they are n_partitions x N: at C(24,12) with N=500 that is
         10 GB. Not a tuning knob, a hard ceiling -- and the second
         independent reason the kernel must stream its reduction rather than
-        materialise anything.
+        materialise anything. Python paths only.
+    store_lambdas : keep the per-partition lambda, rank and winner vectors.
+        C++ path only; the Python paths accumulate them either way. Turning
+        it off is what makes very large S feasible at all: the four detail
+        arrays cost 28 bytes per partition, which is 17 GB at C(32,16), while
+        the summary keys ("pbo", "n_degenerate") cost nothing and stream.
+    n_threads : C++ path only. 0 means every core. The partition range is
+        split contiguously and each thread writes only its own slice, so the
+        result does not depend on this value -- it is a speed knob, never an
+        answer knob.
 
     Reading the result: PBO near 0 means winners keep winning. Near 0.5 means
     selection is a coin flip. Above 0.5 means selection is actively
@@ -400,14 +527,30 @@ def pbo(
     is not.
     """
     m = _validate(returns)
+
     if method == "auto":
-        method = "sufstats"
+        method = "cpp" if (_cscv is not None and not store_scores) else "sufstats"
+
+    if method == "cpp":
+        if _cscv is None:
+            raise RuntimeError(
+                "method='cpp' requested but the kernel is not built; run "
+                "scripts/build_kernel.py, or use method='sufstats'"
+            )
+        if store_scores:
+            raise ValueError(
+                "store_scores is not available on the C++ path: the kernel "
+                "streams its reduction and never materialises the "
+                "n_partitions x N score matrices. Use method='sufstats'."
+            )
+        return _pbo_cpp(m, n_blocks, store_lambdas, n_threads)
     if method == "sufstats":
         return _pbo_sufstats(m, n_blocks, store_scores)
     if method == "naive":
         return _pbo_naive(m, n_blocks, store_scores)
     raise ValueError(
-        f"unknown method {method!r}; expected 'auto', 'sufstats' or 'naive'"
+        f"unknown method {method!r}; expected 'auto', 'cpp', 'sufstats' "
+        "or 'naive'"
     )
 
 

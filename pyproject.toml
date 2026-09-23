@@ -17,6 +17,12 @@ dev = [
     "pytest>=8.0",
     "matplotlib>=3.8",
     "pandas>=2.0",
+    # Header-only, and only needed to BUILD the optional C++ kernel via
+    # scripts/build_kernel.py -- never imported at runtime. The kernel is
+    # deliberately not a setuptools Extension: it must stay optional, and an
+    # extension that fails to compile would break `pip install` for everyone
+    # who is happy with the numpy path.
+    "pybind11>=2.12",
 ]
 
 [tool.setuptools.packages.find]
